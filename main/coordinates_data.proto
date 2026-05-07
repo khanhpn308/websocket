@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+message coordinates_data {
+    uint32 device_id = 1;
+    uint32 type = 2;
+    float x = 3;
+    float y = 4;
+    uint64 timestamp_ms = 5;
+}

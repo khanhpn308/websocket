@@ -1,0 +1,32 @@
+dependencies:
+  espressif/esp_websocket_client:
+    component_hash: 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.1
+  nikas-belogolov/nanopb:
+    component_hash: 6ab5c72064ab6a748ad72528f007f87c7a090a893eb22fa9af5b6f112259b8c9
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.4.10
+direct_dependencies:
+- espressif/esp_websocket_client
+- idf
+- nikas-belogolov/nanopb
+manifest_hash: 7d683c640e632235763bd421a1138184dfad3943cb60e35256f59dcd32639476
+target: esp32
+version: 2.0.0

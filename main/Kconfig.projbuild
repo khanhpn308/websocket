@@ -22,11 +22,6 @@ menu "Example Configuration"
         help
             1(map),2(voltage),3(current).4(temperature),5(vibration).
 
-    config DEVICE_ID
-        int "Device ID"
-        default 1
-        help
-            Device ID for the example to use.
 
     config ENABLE_WEBSOCKET_PING
         bool "Enable WebSocket ping task"

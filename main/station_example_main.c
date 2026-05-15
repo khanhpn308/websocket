@@ -6,10 +6,9 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
-#include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
-#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -18,18 +17,12 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "esp_timer.h"
 #include "esp_sntp.h"
-
-#include "pb_encode.h"
-#include "coordinates_data.pb.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
-
-#include "esp_websocket_client.h"
-
-#include "random.h"
+#include "websocket.h"
+#include "mqtt.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -39,19 +32,6 @@
 #define EXAMPLE_ESP_WIFI_SSID CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_PASS CONFIG_ESP_WIFI_PASSWORD
 #define EXAMPLE_ESP_MAXIMUM_RETRY CONFIG_ESP_MAXIMUM_RETRY
-#define URL_WS CONFIG_URL_WS
-#define DEVICE_ID_NUM 241418
-#define STRINGIFY_IMPL(x) #x
-#define STRINGIFY(x) STRINGIFY_IMPL(x)
-#define DEVICE_ID_STR STRINGIFY(DEVICE_ID_NUM)
-#define FULL_URI URL_WS DEVICE_ID_STR
-#define TYPE_ID CONFIG_TYPE_ID
-#define WS_PACKET_SIZE_2KB 2048
-#define WS_PACKET_SIZE_4KB 4096
-#define WS_PACKET_SIZE_10KB 10240
-// #define WS_PING_PACKET_SIZE WS_PACKET_SIZE_2KB
-#define WS_PING_PACKET_SIZE WS_PACKET_SIZE_4KB
-// #define WS_PING_PACKET_SIZE WS_PACKET_SIZE_10KB
 
 #if CONFIG_ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HUNT_AND_PECK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
@@ -81,38 +61,27 @@
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
 #endif
 
-// Đừng quên include file header được sinh ra từ lệnh compile nanopb
-// #include "coordinates_data.pb.h"
+#define type_id 1
+/*  1: gps
+    2: temperature
+    3: current
+    4: voltage
+    5: vibration
+*/
+#define device_id 873070
+
 static const char *TAG = "wifi station";
-bool encode_device_data(uint8_t *out_buffer, size_t max_length, size_t *out_encoded_len, float coord_x, float coord_y)
+
+float x = 1.0f;
+float y = 1.0f;
+
+typedef enum
 {
+    websocket_protocol = 0,
+    mqtt_protocol = 1,
+} protocol_t;
 
-    // 1. KHỞI TẠO ZERO: Sử dụng đúng tên message của bạn + "_init_zero"
-    coordinates_data msg = coordinates_data_init_zero;
-
-    // 2. Gán giá trị: Gọi đúng tên biến 100% như trong file .proto
-    msg.device_id = DEVICE_ID_NUM;
-    msg.type = TYPE_ID;
-    msg.x = coord_x;
-    msg.y = coord_y;
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    msg.timestamp_ms = (uint64_t)now.tv_sec * 1000ULL + (uint64_t)(now.tv_usec / 1000ULL);
-
-    // 3. Khởi tạo luồng và mã hóa 
-    pb_ostream_t stream = pb_ostream_from_buffer(out_buffer, max_length);
-
-    bool status = pb_encode(&stream, coordinates_data_fields, &msg);
-
-    if (!status)
-    {
-        // Xử lý lỗi
-        return false;
-    }
-
-    *out_encoded_len = stream.bytes_written;
-    return true;
-}
+protocol_t current_protocol = websocket_protocol;
 
 static void set_timezone_utc_plus_7(void)
 {
@@ -151,193 +120,6 @@ static void initialize_sntp_time(void)
     }
 
     ESP_LOGW(TAG, "SNTP sync timeout, timestamps may still be incorrect until time is set");
-}
-
-// Biến toàn cục quản lý client
-esp_websocket_client_handle_t ws_client;
-
-typedef struct
-{
-    bool waiting_for_echo;
-    bool echo_received;
-    uint32_t sequence;
-    size_t payload_len;
-    uint64_t sent_ms;
-    uint64_t received_ms;
-    uint8_t payload[WS_PACKET_SIZE_10KB];
-} websocket_ping_state_t;
-
-static websocket_ping_state_t s_ws_ping_state = {0};
-static portMUX_TYPE s_ws_ping_lock = portMUX_INITIALIZER_UNLOCKED;
-
-static void fill_random_bytes(uint8_t *buffer, size_t len);
-
-static bool payload_contains_ping_seq(const char *data, int data_len, uint32_t sequence)
-{
-    char marker[32];
-    int marker_len = snprintf(marker, sizeof(marker), "PING|seq=%lu|", (unsigned long)sequence);
-
-    if (marker_len <= 0 || marker_len > data_len)
-    {
-        return false;
-    }
-
-    for (int i = 0; i <= data_len - marker_len; i++)
-    {
-        if (memcmp(data + i, marker, (size_t)marker_len) == 0)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void start_websocket_ping(uint32_t sequence)
-{
-    size_t target_packet_size = WS_PING_PACKET_SIZE;
-    uint64_t sent_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
-    int payload_len = snprintf((char *)s_ws_ping_state.payload,
-                               sizeof(s_ws_ping_state.payload),
-                               "PING|seq=%lu|sent_ms=%llu|size=%u|",
-                               (unsigned long)sequence,
-                               (unsigned long long)sent_ms,
-                               (unsigned int)target_packet_size);
-
-    if (payload_len < 0 || (size_t)payload_len >= target_packet_size)
-    {
-        ESP_LOGE(TAG, "Failed to build ping payload");
-        return;
-    }
-
-    fill_random_bytes(s_ws_ping_state.payload + payload_len, target_packet_size - (size_t)payload_len);
-
-    portENTER_CRITICAL(&s_ws_ping_lock);
-    s_ws_ping_state.waiting_for_echo = true;
-    s_ws_ping_state.echo_received = false;
-    s_ws_ping_state.sequence = sequence;
-    s_ws_ping_state.payload_len = target_packet_size;
-    s_ws_ping_state.sent_ms = sent_ms;
-    s_ws_ping_state.received_ms = 0;
-    portEXIT_CRITICAL(&s_ws_ping_lock);
-
-    int sent = esp_websocket_client_send_bin(ws_client,
-                                             (const char *)s_ws_ping_state.payload,
-                                             (int)s_ws_ping_state.payload_len,
-                                             portMAX_DELAY);
-    if (sent < 0)
-    {
-        ESP_LOGE(TAG, "Failed to send websocket ping payload");
-
-        portENTER_CRITICAL(&s_ws_ping_lock);
-        s_ws_ping_state.waiting_for_echo = false;
-        portEXIT_CRITICAL(&s_ws_ping_lock);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Ping sent seq=%lu size=%u bytes", (unsigned long)sequence, (unsigned int)s_ws_ping_state.payload_len);
-}
-
-static bool handle_websocket_ping_echo(const esp_websocket_event_data_t *data)
-{
-    bool matched = false;
-    uint32_t expected_sequence = 0;
-    size_t expected_len = 0;
-
-    portENTER_CRITICAL(&s_ws_ping_lock);
-    expected_sequence = s_ws_ping_state.sequence;
-    expected_len = s_ws_ping_state.payload_len;
-    bool waiting_for_echo = s_ws_ping_state.waiting_for_echo;
-    portEXIT_CRITICAL(&s_ws_ping_lock);
-
-    if (waiting_for_echo && data->data_ptr && data->data_len > 0)
-    {
-        bool exact_match = (data->data_len == (int)expected_len) &&
-                           (memcmp(data->data_ptr, s_ws_ping_state.payload, expected_len) == 0);
-        bool marker_match = payload_contains_ping_seq(data->data_ptr, data->data_len, expected_sequence);
-
-        if (exact_match || marker_match)
-        {
-            portENTER_CRITICAL(&s_ws_ping_lock);
-            s_ws_ping_state.echo_received = true;
-            s_ws_ping_state.waiting_for_echo = false;
-            s_ws_ping_state.received_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
-            portEXIT_CRITICAL(&s_ws_ping_lock);
-            matched = true;
-        }
-    }
-
-    if (matched)
-    {
-        ESP_LOGI(TAG, "Echo payload matched for seq=%lu", (unsigned long)expected_sequence);
-    }
-
-    return matched;
-}
-
-static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
-    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
-
-    switch (event_id)
-    {
-    case WEBSOCKET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "WebSocket connected");
-        break;
-    case WEBSOCKET_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "WebSocket disconnected");
-        break;
-    case WEBSOCKET_EVENT_DATA:
-        if (data->op_code == 10)
-        {
-            ESP_LOGI(TAG, "WebSocket pong received");
-            break;
-        }
-
-        if (handle_websocket_ping_echo(data))
-        {
-            break;
-        }
-
-        {
-            bool waiting = false;
-            portENTER_CRITICAL(&s_ws_ping_lock);
-            waiting = s_ws_ping_state.waiting_for_echo;
-            portEXIT_CRITICAL(&s_ws_ping_lock);
-
-            if (waiting && data->data_ptr && data->data_len > 0)
-            {
-                int show = data->data_len > 128 ? 128 : data->data_len;
-                ESP_LOGD(TAG, "Ignored WebSocket payload: %.*s", show, data->data_ptr);
-            }
-        }
-        break;
-    case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGE(TAG, "WebSocket error");
-        break;
-    default:
-        break;
-    }
-}
-
-// 1. Hàm khởi tạo WebSocket (Gọi hàm này sau khi Wi-Fi báo kết nối thành công)
-void init_websocket(void)
-{
-    esp_websocket_client_config_t websocket_cfg = {
-        // Thay IP bằng IP máy tính chạy FastAPI (tuyệt đối không dùng localhost/127.0.0.1)
-        .uri = FULL_URI,
-    };
-    ESP_LOGI(TAG, "Initializing WebSocket with URI: %s", FULL_URI);
-
-    ws_client = esp_websocket_client_init(&websocket_cfg);
-    if (ws_client == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to initialize WebSocket client");
-        return;
-    }
-
-    ESP_ERROR_CHECK(esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)ws_client));
-    esp_websocket_client_start(ws_client);
 }
 
 /* FreeRTOS event group to signal when we are connected*/
@@ -453,21 +235,6 @@ void wifi_init_sta(void)
     }
 }
 
-float x = 1.0f;
-float y = 1.0f;
-
-static void fill_random_bytes(uint8_t *buffer, size_t len)
-{
-    size_t offset = 0;
-    while (offset < len)
-    {
-        uint32_t rnd = esp_random();
-        size_t chunk = (len - offset) < sizeof(rnd) ? (len - offset) : sizeof(rnd);
-        memcpy(buffer + offset, &rnd, chunk);
-        offset += chunk;
-    }
-}
-
 // 1. Định nghĩa cấu trúc của Task
 #if 0
 void random_generator_task(void *pvParameters)
@@ -491,89 +258,6 @@ void random_generator_task(void *pvParameters)
 }
 #endif
 
-// 2. Task gửi dữ liệu Tọa độ được mã hóa Protobuf khi có data mới
-void send_fake_coordinates_task(void *pvParameters)
-{
-    uint8_t payload[256];
-    size_t encoded_len = 0;
-
-    while (1)
-    {
-        if (esp_websocket_client_is_connected(ws_client))
-        {
-            // Mã hóa dữ liệu Protobuf với tọa độ hiện tại
-            if (encode_device_data(payload, sizeof(payload), &encoded_len, x, y))
-            {
-                // Comment gói rác ở luồng tọa độ, chỉ gửi protobuf thuần.
-                // fill_random_bytes(payload + encoded_len, target_packet_size - encoded_len);
-
-                ESP_LOGI(TAG, "Sending coordinates: X=%.2f Y=%.2f protobuf=%u", x, y, (unsigned int)encoded_len);
-                esp_websocket_client_send_bin(ws_client, (const char *)payload, (int)encoded_len, portMAX_DELAY);
-            }
-            else
-            {
-                ESP_LOGE(TAG, "Failed to encode data");
-            }
-        }
-        else
-        {
-            ESP_LOGW(TAG, "WebSocket not connected");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-void websocket_ping_task(void *pvParameters)
-{
-    uint32_t sequence = 1;
-
-    while (1)
-    {
-        if (esp_websocket_client_is_connected(ws_client))
-        {
-            start_websocket_ping(sequence);
-
-            while (1)
-            {
-                bool echo_received = false;
-                uint64_t sent_ms = 0;
-                uint64_t received_ms = 0;
-                uint32_t current_sequence = 0;
-
-                portENTER_CRITICAL(&s_ws_ping_lock);
-                echo_received = s_ws_ping_state.echo_received;
-                sent_ms = s_ws_ping_state.sent_ms;
-                received_ms = s_ws_ping_state.received_ms;
-                current_sequence = s_ws_ping_state.sequence;
-                portEXIT_CRITICAL(&s_ws_ping_lock);
-
-                if (echo_received && current_sequence == sequence)
-                {
-                    // vTaskDelay(pdMS_TO_TICKS(2000));
-                    ESP_LOGW(TAG, "WebSocket latency seq=%lu send_ms=%llu recv_ms=%llu delay_ms=%llu",
-                             (unsigned long)sequence,
-                             (unsigned long long)sent_ms,
-                             (unsigned long long)received_ms,
-                             (unsigned long long)((received_ms - sent_ms) / 2ULL));
-                    sequence++;
-                    break;
-                }
-
-                if (!esp_websocket_client_is_connected(ws_client))
-                {
-                    ESP_LOGW(TAG, "WebSocket disconnected while waiting for ping echo");
-                    break;
-                }
-
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
-
 void app_main(void)
 {
     // Initialize NVS
@@ -596,10 +280,22 @@ void app_main(void)
     wifi_init_sta();
     set_timezone_utc_plus_7();
     initialize_sntp_time();
-    init_websocket();
-    // xTaskCreate(random_generator_task, "random_task", 2048, NULL, 5, NULL);
-    xTaskCreate(send_fake_coordinates_task, "send_coordinates_task", 4096, NULL, 5, NULL);
-#if CONFIG_ENABLE_WEBSOCKET_PING
-    xTaskCreate(websocket_ping_task, "websocket_ping_task", 4096, NULL, 5, NULL);
-#endif
+    payload_app_config_t payload_config = {
+        .x = &x,
+        .y = &y,
+        .device_id = device_id,
+        .type_id = type_id,
+    };
+
+    switch (current_protocol)
+    {
+    case websocket_protocol:
+        websocket_app_start(&payload_config);
+        break;
+    case mqtt_protocol:
+        mqtt_app_start(&payload_config);
+        break;
+    default:
+        break;
+    }
 }

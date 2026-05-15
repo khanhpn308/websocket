@@ -7,6 +7,3 @@
 #endif
 
 PB_BIND(coordinates_data, coordinates_data, AUTO)
-
-
-

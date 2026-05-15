@@ -16,15 +16,15 @@ menu "Example Configuration"
         default "ws://echo.websocket.org"
         help
             Websocket URL for the example to connect to.
-    config TYPE_ID
-        int "Type ID"
-        default 1
+
+    config MQTT_URI
+        string "MQTT Broker URI"
+        default "mqtt://test.mosquitto.org"
         help
-            1(map),2(voltage),3(current).4(temperature),5(vibration).
+            MQTT broker URI used by the MQTT client.
 
-
-    config ENABLE_WEBSOCKET_PING
-        bool "Enable WebSocket ping task"
+    config ENABLE_PAYLOAD_PING
+        bool "Enable ping task"
         default y
         help
             Enable periodic application-level ping packets for websocket echo latency measurement.

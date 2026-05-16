@@ -4,6 +4,7 @@
 #include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -16,6 +17,7 @@
 #include "esp_websocket_client.h"
 
 #include "websocket.h"
+#include "ping_state.h"
 
 #define URL_WS CONFIG_URL_WS
 #define WS_PACKET_SIZE_10KB 10240
@@ -25,22 +27,13 @@
 
 static const char *TAG = "websocket";
 
-static websocket_app_config_t s_config = {0};
-static esp_websocket_client_handle_t s_ws_client;
+static payload_app_config_t s_config = {0};
+static esp_websocket_client_handle_t s_ws_client = NULL;
+static EventGroupHandle_t s_ws_event_group = 0;
+static uint32_t s_last_published_seq = 0;
 
-typedef struct
-{
-    bool waiting_for_echo;
-    bool echo_received;
-    uint32_t sequence;
-    size_t payload_len;
-    uint64_t sent_ms;
-    uint64_t received_ms;
-    uint8_t payload[WS_PACKET_SIZE_10KB];
-} payload_ping_state_t;
-
-static payload_ping_state_t s_ws_ping_state = {0};
-static portMUX_TYPE s_ws_ping_lock = portMUX_INITIALIZER_UNLOCKED;
+#define WS_EVENT_CONNECTED_BIT BIT0
+#define WS_EVENT_DATA_READY_BIT BIT1
 
 static void fill_random_bytes(uint8_t *buffer, size_t len)
 {
@@ -80,10 +73,13 @@ static bool handle_websocket_ping_echo(const esp_websocket_event_data_t *data)
     bool matched = false;
     uint32_t expected_sequence = 0;
     size_t expected_len = 0;
+    uint64_t sent_ms = 0;
+    uint64_t received_ms = 0;
 
     portENTER_CRITICAL(&s_ws_ping_lock);
     expected_sequence = s_ws_ping_state.sequence;
     expected_len = s_ws_ping_state.payload_len;
+    sent_ms = s_ws_ping_state.sent_ms;
     bool waiting_for_echo = s_ws_ping_state.waiting_for_echo;
     portEXIT_CRITICAL(&s_ws_ping_lock);
 
@@ -99,6 +95,7 @@ static bool handle_websocket_ping_echo(const esp_websocket_event_data_t *data)
             s_ws_ping_state.echo_received = true;
             s_ws_ping_state.waiting_for_echo = false;
             s_ws_ping_state.received_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+            received_ms = s_ws_ping_state.received_ms;
             portEXIT_CRITICAL(&s_ws_ping_lock);
             matched = true;
         }
@@ -106,7 +103,16 @@ static bool handle_websocket_ping_echo(const esp_websocket_event_data_t *data)
 
     if (matched)
     {
+        uint64_t rtt_ms = (received_ms >= sent_ms) ? (received_ms - sent_ms) : 0;
+        uint64_t delay_ms = rtt_ms / 2ULL;
         ESP_LOGI(TAG, "Echo payload matched for seq=%lu", (unsigned long)expected_sequence);
+        ESP_LOGW(TAG,
+                 "WebSocket latency seq=%lu send_ms=%llu recv_ms=%llu rtt_ms=%llu delay_ms=%llu",
+                 (unsigned long)expected_sequence,
+                 (unsigned long long)sent_ms,
+                 (unsigned long long)received_ms,
+                 (unsigned long long)rtt_ms,
+                 (unsigned long long)delay_ms);
     }
 
     return matched;
@@ -123,9 +129,17 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "WebSocket connected");
+        if (s_ws_event_group != 0)
+        {
+            xEventGroupSetBits(s_ws_event_group, WS_EVENT_CONNECTED_BIT);
+        }
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "WebSocket disconnected");
+        if (s_ws_event_group != 0)
+        {
+            xEventGroupClearBits(s_ws_event_group, WS_EVENT_CONNECTED_BIT);
+        }
         break;
     case WEBSOCKET_EVENT_DATA:
         if (data->op_code == 10)
@@ -211,91 +225,73 @@ static void start_websocket_ping(uint32_t sequence)
     ESP_LOGI(TAG, "Ping sent seq=%lu size=%u bytes", (unsigned long)sequence, (unsigned int)s_ws_ping_state.payload_len);
 }
 
+void websocket_app_notify_new_data(void)
+{
+    if (s_ws_event_group != 0)
+    {
+        xEventGroupSetBits(s_ws_event_group, WS_EVENT_DATA_READY_BIT);
+    }
+}
+
 static void send_fake_coordinates_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    uint8_t payload[256];
-    size_t encoded_len = 0;
-
     while (1)
     {
+        if (s_ws_event_group == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupWaitBits(s_ws_event_group,
+                                               WS_EVENT_CONNECTED_BIT | WS_EVENT_DATA_READY_BIT,
+                                               pdFALSE,
+                                               pdTRUE,
+                                               portMAX_DELAY);
+
+        if ((bits & WS_EVENT_CONNECTED_BIT) == 0)
+        {
+            continue;
+        }
+
         if (esp_websocket_client_is_connected(s_ws_client))
         {
-            float x = s_config.x ? *s_config.x : 0.0f;
-            float y = s_config.y ? *s_config.y : 0.0f;
-
-            if (encode_coordinates(payload, sizeof(payload), &encoded_len, s_config.device_id, s_config.type_id, x, y))
+            uint32_t current_seq = s_config.data_seq ? *s_config.data_seq : 0;
+            if (current_seq != s_last_published_seq)
             {
-                ESP_LOGI(TAG, "Sending coordinates: X=%.2f Y=%.2f protobuf=%u", x, y, (unsigned int)encoded_len);
-                esp_websocket_client_send_bin(s_ws_client, (const char *)payload, (int)encoded_len, portMAX_DELAY);
+                uint8_t payload[256];
+                size_t encoded_len = 0;
+                float x = s_config.x ? *s_config.x : 0.0f;
+                float y = s_config.y ? *s_config.y : 0.0f;
+
+                if (encode_coordinates(payload, sizeof(payload), &encoded_len, s_config.device_id, s_config.type_id, x, y))
+                {
+                    ESP_LOGI(TAG, "Sending coordinates: X=%.2f Y=%.2f protobuf=%u", x, y, (unsigned int)encoded_len);
+                    esp_websocket_client_send_bin(s_ws_client, (const char *)payload, (int)encoded_len, portMAX_DELAY);
+                    start_websocket_ping(current_seq);
+                    s_last_published_seq = current_seq;
+                    xEventGroupClearBits(s_ws_event_group, WS_EVENT_DATA_READY_BIT);
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Failed to encode data");
+                }
             }
             else
             {
-                ESP_LOGE(TAG, "Failed to encode data");
+                xEventGroupClearBits(s_ws_event_group, WS_EVENT_DATA_READY_BIT);
             }
         }
         else
         {
             ESP_LOGW(TAG, "WebSocket not connected");
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-static void websocket_ping_task(void *pvParameters)
-{
-    (void)pvParameters;
-
-    uint32_t sequence = 1;
-
-    while (1)
-    {
-        if (esp_websocket_client_is_connected(s_ws_client))
-        {
-            start_websocket_ping(sequence);
-
-            while (1)
-            {
-                bool echo_received = false;
-                uint64_t sent_ms = 0;
-                uint64_t received_ms = 0;
-                uint32_t current_sequence = 0;
-
-                portENTER_CRITICAL(&s_ws_ping_lock);
-                echo_received = s_ws_ping_state.echo_received;
-                sent_ms = s_ws_ping_state.sent_ms;
-                received_ms = s_ws_ping_state.received_ms;
-                current_sequence = s_ws_ping_state.sequence;
-                portEXIT_CRITICAL(&s_ws_ping_lock);
-
-                if (echo_received && current_sequence == sequence)
-                {
-                    ESP_LOGW(TAG, "WebSocket latency seq=%lu send_ms=%llu recv_ms=%llu delay_ms=%llu",
-                             (unsigned long)sequence,
-                             (unsigned long long)sent_ms,
-                             (unsigned long long)received_ms,
-                             (unsigned long long)((received_ms - sent_ms) / 2ULL));
-                    sequence++;
-                    break;
-                }
-
-                if (!esp_websocket_client_is_connected(s_ws_client))
-                {
-                    ESP_LOGW(TAG, "WebSocket disconnected while waiting for ping echo");
-                    break;
-                }
-
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
-
-void websocket_app_start(const websocket_app_config_t *config)
+void websocket_app_start(const payload_app_config_t *config)
 {
     if (config == NULL)
     {
@@ -325,11 +321,13 @@ void websocket_app_start(const websocket_app_config_t *config)
         return;
     }
 
+    if (s_ws_event_group == 0)
+    {
+        s_ws_event_group = xEventGroupCreate();
+    }
+
     ESP_ERROR_CHECK(esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)s_ws_client));
     esp_websocket_client_start(s_ws_client);
 
     xTaskCreate(send_fake_coordinates_task, "send_coordinates_task", 4096, NULL, 5, NULL);
-#if CONFIG_ENABLE_PAYLOAD_PING
-    xTaskCreate(websocket_ping_task, "websocket_ping_task", 4096, NULL, 5, NULL);
-#endif
 }

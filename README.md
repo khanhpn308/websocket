@@ -87,3 +87,31 @@ Project hỗ trợ các target ESP32, ESP32-C2, ESP32-C3, ESP32-C5, ESP32-C6, ES
 - Không có IP: kiểm tra SSID/password và tín hiệu Wi-Fi.
 - Không sync được thời gian: kiểm tra kết nối Internet để ESP32 truy cập được NTP server.
 - Không thấy latency log: kiểm tra server WebSocket có echo lại payload ping hay không, và thử giảm mức lọc log nếu cần.
+
+## Tuỳ chỉnh nhanh (protocol, kích thước ping, topic MQTT)
+
+- **Thay đổi protocol (WebSocket / MQTT):**
+  - Mở file `main/station_example_main.c` và thay đổi giá trị của biến `current_protocol` thành `websocket_protocol` hoặc `mqtt_protocol` trước khi gọi `websocket_app_start()` / `mqtt_app_start()`.
+  - Nếu bạn muốn chọn protocol ở thời gian build/runtime, hãy thêm một cờ cấu hình (`Kconfig`) hoặc sử dụng `menuconfig` để expose một `CONFIG_` và đọc giá trị đó trong `app_main()`.
+
+- **Đổi kích thước payload ping (MQTT):**
+  - File: [components/mqtt/mqtt.c](components/mqtt/mqtt.c)
+  - Mở hàm `mqtt_ping_task()` và chỉnh kích thước buffer `char payload[32];` thành `char payload[64];` (hoặc lớn hơn nếu muốn). Đồng thời đảm bảo `snprintf()` không vượt kích thước buffer.
+  - Tương tự với WebSocket ping, sửa trong component WebSocket (thường là `components/websocket/*`) thay đổi buffer và định dạng payload nếu cần.
+
+- **Thay đổi topic MQTT (publish / subscribe):**
+  - File: [components/mqtt/mqtt.c](components/mqtt/mqtt.c)
+  - Các topic mặc định hiện tại:
+    - Ping publish: `esp32/gps/publish/ping/{deviceid}` (`s_ping_pub_topic`)
+    - Ping subscribe: `esp32/gps/subcribe/ping/{deviceid}` (`s_ping_sub_topic`)
+    - Data publish: `esp32/gps/publish/data/{deviceid}` (`s_data_pub_topic`)
+    - Data subscribe: `esp32/gps/subcribe/data/{deviceid}` (`s_data_sub_topic`)
+  - Để thay đổi, sửa chuỗi format trong `snprintf()` khi khởi tạo các biến trên (tìm `snprintf(..."esp32/gps/.../", ...)`).
+  - Sau chỉnh sửa, build lại project:
+    ```bash
+    idf.py build flash monitor
+    ```
+
+- **Gợi ý:** nếu muốn topic có cấu trúc khác (ví dụ `myorg/dev/{id}/ping`), cập nhật cả phần publish và subscribe để server và thiết bị đồng bộ.
+
+Nếu muốn, tôi có thể chuyển các format topic và kích thước ping sang `Kconfig` để dễ cấu hình qua `menuconfig` — bạn có muốn tôi làm điều đó không?

@@ -21,8 +21,9 @@
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "esp_random.h"
 #include "websocket.h"
-#include "mqtt.h"
+#include "mqtt_app.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -61,19 +62,21 @@
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WAPI_PSK
 #endif
 
-#define type_id 1
+#define data_freq_ms 200
+#define APP_TYPE_ID 1
 /*  1: gps
     2: temperature
     3: current
     4: voltage
     5: vibration
 */
-#define device_id 873070
+#define APP_DEVICE_ID 873070
 
 static const char *TAG = "wifi station";
 
 float x = 1.0f;
 float y = 1.0f;
+volatile uint32_t data_seq = 0;
 
 typedef enum
 {
@@ -81,7 +84,14 @@ typedef enum
     mqtt_protocol = 1,
 } protocol_t;
 
-protocol_t current_protocol = websocket_protocol;
+protocol_t current_protocol = mqtt_protocol;
+
+static float generate_random_float(float min, float max)
+{
+    uint32_t random_value = esp_random();
+    float normalized = (float)random_value / (float)UINT32_MAX;
+    return min + (normalized * (max - min));
+}
 
 static void set_timezone_utc_plus_7(void)
 {
@@ -92,9 +102,9 @@ static void set_timezone_utc_plus_7(void)
 static void initialize_sntp_time(void)
 {
     ESP_LOGI(TAG, "Initializing SNTP");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
 
     time_t now = 0;
     struct tm timeinfo = {0};
@@ -235,28 +245,26 @@ void wifi_init_sta(void)
     }
 }
 
-// 1. Định nghĩa cấu trúc của Task
-#if 0
-void random_generator_task(void *pvParameters)
+// Random data generator task
+static void random_generator_task(void *pvParameters)
 {
-    // Task trong FreeRTOS luôn phải chạy trong một vòng lặp vô hạn
+    (void)pvParameters;
     while (1)
     {
-        // Sinh giá trị ngẫu nhiên
-        x = generate_random_float(0.0f, 100.0f); // Ví dụ dải giá trị từ 0 đến 100
-        y = generate_random_float(5.0f, 50.0f);  // Ví dụ dải giá trị từ 5 đến 50
+        // Generate random values
+        x = generate_random_float(0.0f, 100.0f);
+        y = generate_random_float(5.0f, 50.0f);
+        data_seq++;
 
-        // In kết quả ra console (monitor)
-        //printf("Gia tri tao ra - X: %.2f | Y: %.2f\n", x, y);
+        mqtt_app_notify_new_data();
+        websocket_app_notify_new_data();
 
-        // Báo hiệu có data mới
-        data_updated = true;
+        ESP_LOGW(TAG, "Generated random data: X=%.2f Y=%.2f", x, y);
 
-        // Tạm dừng task này đúng 200ms
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        vTaskDelay(pdMS_TO_TICKS(data_freq_ms));
     }
 }
-#endif
 
 void app_main(void)
 {
@@ -280,11 +288,16 @@ void app_main(void)
     wifi_init_sta();
     set_timezone_utc_plus_7();
     initialize_sntp_time();
+
+    // Start random data generator task
+    xTaskCreate(random_generator_task, "random_gen", 2048, NULL, 3, NULL);
+
     payload_app_config_t payload_config = {
         .x = &x,
         .y = &y,
-        .device_id = device_id,
-        .type_id = type_id,
+        .data_seq = &data_seq,
+        .device_id = APP_DEVICE_ID,
+        .type_id = APP_TYPE_ID,
     };
 
     switch (current_protocol)

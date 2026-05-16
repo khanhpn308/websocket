@@ -1,3 +1,4 @@
+void mqtt_app_notify_new_data(void);
 #ifndef MQTT_APP_H
 #define MQTT_APP_H
 
